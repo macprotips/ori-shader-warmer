@@ -78,9 +78,11 @@ func findGame() -> URL? {
 /// The bottle that runs the game: the one it is installed in, else one whose Steam library holds it, else the newest bottle.
 func bottle(for game: URL) -> String? {
     let all = bottles()
-    let path = game.resolvingSymlinksInPath().path
-    if let b = all.first(where: { path.hasPrefix($0.resolvingSymlinksInPath().path + "/") }) { return b.lastPathComponent }
-    if let b = all.first(where: { steamLibraries(in: $0).contains { path.hasPrefix($0.resolvingSymlinksInPath().path + "/") } }) { return b.lastPathComponent }
+    // macOS paths are case-insensitive, and Steam's library list doesn't always match the folder's case
+    let path = game.resolvingSymlinksInPath().path.lowercased()
+    let holds = { (dir: URL) in path.hasPrefix(dir.resolvingSymlinksInPath().path.lowercased() + "/") }
+    if let b = all.first(where: holds) { return b.lastPathComponent }
+    if let b = all.first(where: { steamLibraries(in: $0).contains(where: holds) }) { return b.lastPathComponent }
     return all.first?.lastPathComponent
 }
 
@@ -88,9 +90,25 @@ func bottle(for game: URL) -> String? {
 struct Runtime: Hashable {
     let name: String
     let wine: String                // the Wine the game runs with
-    let bottle: String
+    let bottle: String?             // CrossOver bottle; nil when env sets up the Wine prefix (NotProton)
+    var env: [String: String] = [:]
     let metalCache: String          // folder in the user cache dir holding this runner's Metal cache
-    let d3dmetal: String            // D3DMetal build; caches are only valid for the build that made them
+    let d3dmetal: String            // D3DMetal version
+    let build: String               // CrossOver build the runner comes from
+    // A cache only matches the exact D3DMetal and CrossOver build that made it. Same D3DMetal in a different
+    // CrossOver build produces different shader keys, so setups share a cache only when both match.
+    var cacheKey: String { "\(d3dmetal)|\(build)" }
+    var label: String { "D3DMetal \(d3dmetal.split(separator: "-")[0]) · CrossOver \(build.split(separator: ".").prefix(2).joined(separator: "."))" }
+}
+
+/// The CrossOver build a CrossOver tree comes from, e.g. 26.3.0.39832.
+func crossOverBuild(_ root: String) -> String? {
+    guard let conf = try? String(contentsOfFile: "\(root)/share/crossover/data/CrossOver.conf", encoding: .isoLatin1) else { return nil }   // not always valid UTF-8
+    for line in conf.split(separator: "\n") where line.hasPrefix("\"ProductVersion\"") {
+        let parts = line.split(separator: "\"", omittingEmptySubsequences: false).map(String.init)
+        if parts.count >= 4 { return parts[3] }
+    }
+    return nil
 }
 
 /// Version of the D3DMetal a CrossOver tree uses: lib/apple_gptk, else lib64/apple_gptk.
@@ -110,14 +128,34 @@ func crossOverRuntimes(for game: URL) -> [Runtime] {
     return dirs.flatMap { dir in
         ((try? fm.contentsOfDirectory(atPath: dir)) ?? []).filter { $0.hasPrefix("CrossOver") && $0.hasSuffix(".app") }.sorted().compactMap { app in
             let root = "\(dir)/\(app)/Contents/SharedSupport/CrossOver"
-            guard fm.isExecutableFile(atPath: "\(root)/bin/wine"), let v = d3dmetalVersion(root) else { return nil }
+            guard fm.isExecutableFile(atPath: "\(root)/bin/wine"), let v = d3dmetalVersion(root), let b = crossOverBuild(root) else { return nil }
             return Runtime(name: String(app.dropLast(4)), wine: "\(root)/bin/wine", bottle: bottle,
-                           metalCache: "com.codeweavers.CrossOver.wineloader", d3dmetal: v)
+                           metalCache: "com.codeweavers.CrossOver.wineloader", d3dmetal: v, build: b)
         }
     }
 }
 
-func runtimes(for game: URL) -> [Runtime] { crossOverRuntimes(for: game) }
+/// NotProton's Rosetta runner for Ori, which can use D3DMetal. It exists once Ori has been launched with it.
+func notProtonRuntime(for game: URL) -> Runtime? {
+    let home = fm.homeDirectoryForCurrentUser.path
+    let root = "\(home)/Library/Application Support/notproton/launchers/1057090/runner"
+    let loader = "\(root)/lib/wine/x86_64-unix/wine"
+    guard fm.isExecutableFile(atPath: loader), let v = d3dmetalVersion(root), let b = crossOverBuild(root) else { return nil }
+    // Steam keeps the prefix next to the game's library, or in the default library.
+    let library = game.deletingLastPathComponent().deletingLastPathComponent()
+    guard let prefix = [library.path, "\(home)/Library/Application Support/Steam/steamapps"]
+        .map({ "\($0)/compatdata/1057090/pfx" }).first(where: { fm.fileExists(atPath: "\($0)/system.reg") }) else { return nil }
+    let server = ["wineserver", "wineserver-x86"].map { "\(root)/bin/\($0)" }.first { fm.isExecutableFile(atPath: $0) } ?? "\(root)/bin/wineserver"
+    var env = ["CX_ROOT": root, "CX_HOME": "\(home)/Library/Application Support/CrossOver", "WINEPREFIX": prefix,
+               "WINELOADER": loader, "WINESERVER": server, "WINEDLLPATH": "\(root)/lib/wine/x86_64-windows:\(root)/lib/wine/x86_64-unix",
+               "ROSETTA_ADVERTISE_AVX": "1", "PATH": "\(root)/bin:/usr/bin:/bin"]
+    let shared = "\(root)/lib64/apple_gptk/external/libd3dshared.dylib"
+    if fm.fileExists(atPath: shared) { env["CX_APPLEGPTK_LIBD3DSHARED_PATH"] = shared }
+    // Its Wine identifies as CrossOver's, so it shares CrossOver's Metal cache.
+    return Runtime(name: "NotProton", wine: loader, bottle: nil, env: env, metalCache: "com.codeweavers.CrossOver.wineloader", d3dmetal: v, build: b)
+}
+
+func runtimes(for game: URL) -> [Runtime] { crossOverRuntimes(for: game) + [notProtonRuntime(for: game)].compactMap { $0 } }
 
 /// The running-Ori animation (an animated PNG in Resources), looped while the shaders compile.
 struct RunningOri: View {
@@ -151,6 +189,9 @@ final class Warmer: ObservableObject {
     @Published var fraction = 0.0
     @Published var remaining = ""
     private(set) var process: Process?
+    // Without this, macOS slows the app and its compiler down once its window is in the background (App Nap),
+    // and D3DMetal then writes a cache that doesn't match what the game asks for.
+    private var activity: NSObjectProtocol?
     private var retry: (() -> Void)?       // reruns the last attempt with the same game and setup
     private var phase = 1, phaseStart = Date(), buffer = ""
     // share of the bar per phase: reading shaders, compiling, installing
@@ -160,23 +201,24 @@ final class Warmer: ObservableObject {
         retry = nil
         guard let game = gameDir(from: dropped) else { stage = .failed("That isn't the game folder. Choose the Ori and the Will of the Wisps folder in your Steam library, the one with oriwotw.exe in it."); return }
         let all = runtimes(for: game)
-        guard !all.isEmpty else { stage = .failed("CrossOver wasn't found, or no bottle is set up yet."); return }
-        // One build serves every runner on the same D3DMetal. Only ask when they differ.
-        if Set(all.map(\.d3dmetal)).count > 1 { stage = .choose(game, all) } else { run(game, all) }
+        guard !all.isEmpty else { stage = .failed("Couldn't find CrossOver or NotProton set up for this game. If you use NotProton, launch Ori with it once, then try again."); return }
+        // One build serves every setup with the same D3DMetal and CrossOver build. Only ask when they differ.
+        if Set(all.map(\.cacheKey)).count > 1 { stage = .choose(game, all) } else { run(game, all) }
     }
 
-    func choose(_ game: URL, _ picked: Runtime, from all: [Runtime]) { run(game, all.filter { $0.d3dmetal == picked.d3dmetal }, preferred: picked) }
+    func choose(_ game: URL, _ picked: Runtime, from all: [Runtime]) { run(game, all.filter { $0.cacheKey == picked.cacheKey }, preferred: picked) }
 
     func tryAgain() { if let retry { retry() } else { stage = .idle } }
 
     private func run(_ game: URL, _ group: [Runtime], preferred: Runtime? = nil) {
         retry = { [unowned self] in run(game, group, preferred: preferred) }
         guard let script = Bundle.main.path(forResource: "warm", ofType: "sh") else { stage = .failed("The app is incomplete."); return }
-        let rt = preferred ?? group[0]
+        // compile with CrossOver when the group has it: it is the path tested most
+        let rt = group.first { $0.bottle != nil && ($0 == preferred || preferred?.bottle == nil) } ?? preferred ?? group[0]
         let p = Process(), pipe = Pipe()
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
         p.arguments = [script, game.path, rt.wine]
-        var env = ProcessInfo.processInfo.environment
+        var env = ProcessInfo.processInfo.environment.merging(rt.env) { $1 }
         env["BOTTLE"] = rt.bottle
         env["METAL_CACHES"] = Array(Set(group.map(\.metalCache))).sorted().joined(separator: "\n")
         p.environment = env
@@ -192,12 +234,16 @@ final class Warmer: ObservableObject {
             let rest = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
             DispatchQueue.main.async {
                 guard p === self.process else { return }
+                if let a = self.activity { ProcessInfo.processInfo.endActivity(a); self.activity = nil }
                 self.read(rest)
                 if self.stage == .running { self.stage = p.terminationReason == .uncaughtSignal || p.terminationStatus == 2 ? .idle : .failed("Something went wrong. Try again.") }
             }
         }
         stage = .running; label = "Starting"; fraction = 0; remaining = ""; buffer = ""; phase = 1
         process = p
+        if activity == nil {
+            activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .idleSystemSleepDisabled], reason: "Compiling shaders")
+        }
         do { try p.run() } catch { process = nil; stage = .failed("Couldn't start.") }
     }
 
@@ -255,7 +301,7 @@ struct ContentView: View {
     private var idle: some View {
         VStack(spacing: 14) {
             Text("Drop the Ori and the Will of the Wisps folder here").font(.title3.weight(.semibold)).multilineTextAlignment(.center)
-            Text("Takes 10 to 30 minutes, and you only need to do it once.\nRun it again only after a macOS, CrossOver or game update.").font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            Text("Takes 10 to 30 minutes, and you only need to do it once.\nRun it again only after a macOS, CrossOver, NotProton or game update.").font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
             HStack(spacing: 10) {
                 Button("Find Game") {
                     if let game = findGame() { warmer.start(game) }
@@ -277,13 +323,16 @@ struct ContentView: View {
         VStack(spacing: 14) {
             Spacer()
             Text("How do you play Ori?").font(.title3.weight(.semibold))
-            Text("These use different versions of D3DMetal, so the shaders can only be warmed for one.")
+            Text("Each of these needs its own shader cache, so the shaders can only be warmed for one.")
                 .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
             VStack(spacing: 8) {
                 // setups on the same D3DMetal share one cache, so they share a button
-                ForEach(Array(Dictionary(grouping: all, by: \.d3dmetal).values).sorted { $0[0].name < $1[0].name }, id: \.self) { group in
+                ForEach(Array(Dictionary(grouping: all, by: \.cacheKey).values).sorted { $0[0].name < $1[0].name }, id: \.self) { group in
                     Button { warmer.choose(game, group[0], from: all) } label: {
-                        Text(group.map(\.name).joined(separator: " / ")).frame(maxWidth: 300)
+                        VStack(spacing: 2) {
+                            Text(group.map(\.name).joined(separator: " / "))
+                            Text(group[0].label).font(.caption).foregroundStyle(.secondary)
+                        }.frame(maxWidth: 300).padding(.vertical, 4)
                     }
                 }
             }.controlSize(.large).padding(.top, 4)

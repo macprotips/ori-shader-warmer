@@ -21,25 +21,25 @@ D3DM="$CACHES/d3dm"
 BUILT="$D3DM/oriwarm_t.exe/shaders.cache"
 
 fail() { echo "ERROR $1"; exit 1; }
-trap 'pkill -9 -f oriwarm_t.exe; exit 2' TERM INT
+trap 'kill $(jobs -p) 2>/dev/null; pkill -9 -f oriwarm_t.exe; exit 2' TERM INT
 
 [[ -d "$GAME/oriwotw_Data" ]] || fail "That folder doesn't look like Ori and the Will of the Wisps."
-[[ -x "$WINE" ]] || fail "CrossOver wasn't found."
+[[ -x "$WINE" ]] || fail "CrossOver or NotProton wasn't found."
 # A running game shows up as a Windows path, e.g. C:\...\oriwotw.exe.
 ps -Ao command | grep -qiE '^[a-z]:\\.*oriwotw\.exe' && fail "Ori is running. Quit the game and try again."
 # Programs still running under Wine hold Metal cache files open and would overwrite the new ones.
 # Wine takes a few seconds to wind down after its last program quits, so give it a moment.
 crossover_busy() { pgrep -qf 'CrossOver.*wineserver'; }
 for i in {1..15}; do crossover_busy || break; sleep 1; done
-crossover_busy && fail "Quit Steam and any other programs running in CrossOver, then try again."
+crossover_busy && fail "Quit Steam and any other programs running in CrossOver or NotProton, then try again."
 (( $(df -k "$HOME" | awk 'NR==2 {print $4}') > 3000000 )) || fail "Not enough free disk space. About 3 GB is needed."
 mkdir -p "$WORK"
 
 echo "PHASE 1 Reading the game's shaders"
 setopt pipefail
 rm -rf "$WORK/shaders"
-"$R/extract" "$GAME" "$WORK/shaders" | grep --line-buffered '^PROGRESS' \
-  || fail "Couldn't read the game's files. If macOS asked for access, allow it in System Settings, Privacy & Security, then try again."
+"$R/extract" "$GAME" "$WORK/shaders" | grep --line-buffered '^PROGRESS' &
+wait $! || fail "Couldn't read the game's files. If macOS asked for access, allow it in System Settings, Privacy & Security, then try again."
 gunzip -c "$R/plan.txt.gz" > "$WORK/plan.txt" || fail "Couldn't unpack the shader list. Check that there is free disk space."
 
 # The recipe names shaders by content. If most are missing, this is a game version the recipe wasn't made for.
@@ -48,10 +48,18 @@ missing=$(awk 'NR == FNR { have[$1] = 1; next } { n++; if (!($1 in have)) m++ } 
 [[ "$missing" == <-> ]] && (( missing < 10 )) || fail "This version of Ori isn't supported yet."
 
 echo "PHASE 2 Starting the shader compiler"
+# Clear the cache files this run will replace before compiling. Left-over entries from another D3DMetal
+# version in them were seen to spoil a build.
+if [[ -z "${NOINSTALL:-}" ]]; then
+  for folder in ${(f)METAL_CACHES:-com.codeweavers.CrossOver.wineloader}; do
+    rm -f "$CACHES/$folder"/com.apple.metal/*/functions{,1,2,3}.{data,list}(N)
+  done
+fi
 cp "$R/oriwarm_t.exe" "$WORK/"
 rm -f "$WORK/warm.log"
 rm -rf "$D3DM/oriwarm_t.exe"
-total=$(( $(wc -l < "$WORK/plan.txt") ))
+total=$(awk 'NR == FNR { have[$1] = 1; next } ($1 in have) && ($2 == "-" || $2 in have) { n++ } END { print n + 0 }' \
+  <(ls "$WORK/shaders" | sed 's/\.dxbc$//') "$WORK/plan.txt")
 skip=0; started=
 
 compile() {
