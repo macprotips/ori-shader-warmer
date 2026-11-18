@@ -25,6 +25,12 @@ You only need to do this once. If the stutter comes back after a macOS, CrossOve
 - macOS asks for permission to access data from other apps, and to access an external drive if the game is on one. The app needs both to read the game's files.
 - CrossOver and NotProton games share one Metal shader cache, and this replaces it. Other games recompile their shaders the next time you play them.
 
+## Why Ori needs this
+
+Ori is a DirectX 11 game, and DirectX 11 doesn't tell the graphics driver in advance which shader and render-state combinations a game will use. D3DMetal only finds out when something is drawn, and then has to build a Metal pipeline for that exact combination on the spot, which is the hitch. Ori ships about 20,000 shaders, and its effects combine them with many different blend, depth and vertex settings, so the number of combinations is far larger than the shader count. The game's own loading doesn't prepare these combinations ahead of time.
+
+The app works from a list of about 90,000 combinations recorded from the game itself, across every scene and boss fight, and builds them ahead of time. The result is specific to the CrossOver build and D3DMetal version that made it, which is why it has to run on your own Mac and why it asks which setup you play with.
+
 ## Building
 
 Requires Xcode and mingw-w64.
@@ -34,7 +40,7 @@ brew install mingw-w64
 ./build.sh
 ```
 
-`recipe/plan.txt.gz` is the list of shader states the app compiles. It was recorded from the game, across every scene and boss fight.
+`recipe/plan.txt.gz` is the list of combinations the app compiles.
 
 ---
 
