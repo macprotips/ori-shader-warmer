@@ -7,8 +7,8 @@ Ori and the Will of the Wisps stutters under CrossOver whenever something new ap
 ## Usage
 
 1. Download the app from [Releases](../../releases/latest).
-2. Open it and drop your Ori folder on the window, or click **Use Installed Game**.
-3. Leave it for about 12 minutes, with the game closed.
+2. Open it and click **Find Game**, or drop the game folder on the window.
+3. Leave it running with the game closed. It takes 10 to 30 minutes depending on your Mac.
 
 You only need to do this once. If the stutter comes back after a macOS, CrossOver or game update, run it again.
 
@@ -20,7 +20,8 @@ You only need to do this once. If the stutter comes back after a macOS, CrossOve
 
 ## Good to know
 
-- macOS asks for permission to access data from other apps. The app needs it to read the game's files inside the CrossOver bottle.
+- If you have more than one version of CrossOver installed, the app asks which one you play with. Each version uses a different D3DMetal, and the shaders only help the one they were built for.
+- macOS asks for permission to access data from other apps, and to access an external drive if the game is on one. The app needs both to read the game's files.
 - CrossOver games share one Metal shader cache, and this replaces it. Other games recompile their shaders the next time you play them.
 
 ## Building
